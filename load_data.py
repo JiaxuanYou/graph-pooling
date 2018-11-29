@@ -108,3 +108,6 @@ def read_graphfile(datadir, dataname, max_nodes=None):
         graphs.append(nx.relabel_nodes(G, mapping))
     return graphs
 
+# graphs = read_graphfile('data','DD')
+# import pdb
+# pdb.set_trace()

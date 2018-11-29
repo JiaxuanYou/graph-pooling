@@ -2,6 +2,12 @@ import community
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
+from sklearn.manifold import TSNE
+
+import pdb
+import time
+
+
 
 def imsave(fname, arr, vmin=None, vmax=None, cmap=None, format=None, origin=None):
     from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
@@ -152,5 +158,117 @@ def exp_moving_avg(x, decay=0.9):
         shadow -= (1-decay) * (shadow-v)
         a.append(shadow)
     return a
+
+
+
+
+
+# for GCN global
+
+def get_random_subset(G, p=0.5):
+    '''
+    get a random subset of nodes
+    :param G: input graph
+    :param p: prob of including a node
+    :return: a list of nodes, will not be empty
+    '''
+    nodes = G.nodes()
+    while True:
+        rand_values = np.random.rand(len(nodes))
+        if np.any(np.less(rand_values,p)):
+            break
+    nodes_return = [node for id,node in enumerate(nodes) if rand_values[id]<p]
+    return nodes_return
+
+def get_random_subsets(G, c=1):
+    '''
+    get c*log^(n) random subsets of nodes
+    :param G: input graph
+    :param c: repeat same Sij for c*log(n) times
+    :return: list of list of nodes, length fixed
+    '''
+    random_subsets = []
+    for i in range(int(np.log2(G.number_of_nodes()))):
+        p = 1/np.exp2(i+1)
+        for j in range(int(np.log2(G.number_of_nodes())*c)):
+            subset = get_random_subset(G,p)
+            random_subsets.append(subset)
+    return random_subsets
+
+
+def get_shortest_dist(shortest_dist, node_id, random_subsets):
+    '''
+    get the dist from a node to random subsets
+    :param shortest_dist:
+    :param node_id:
+    :param random_subsets:
+    :return: 2-d array, dist
+    TODO: may consider different output format
+    '''
+    node_feature = np.zeros((1,len(random_subsets)))
+    for i, random_subset in enumerate(random_subsets):
+        dist_min = 1e6 # todo: other aggregation possible: min, mean, sum, etc.
+        for node in random_subset:
+            dist = shortest_dist[node]
+            if dist<dist_min:
+                dist_min = dist
+        node_feature[0, i] = dist_min
+    return node_feature
+
+def get_shortest_dists(shortest_dists, random_subsets):
+    '''
+    get dist for all nodes
+    :param shortest_dists:
+    :param random_subsets:
+    :return: 2-d array, num_node * num_subsets
+    '''
+    node_features = np.zeros((len(shortest_dists),len(random_subsets)))
+    for i,node_id in enumerate(shortest_dists):
+        shortest_dist = shortest_dists[node_id]
+        node_feature = get_shortest_dist(shortest_dist,node_id,random_subsets)
+        node_features[i] = node_feature
+    return node_features
+
+
+
+# init graph
+# G = nx.grid_2d_graph(20,20)
+# G = nx.connected_caveman_graph(20,20)
+# G = nx.barabasi_albert_graph(1000,2)
+G = nx.newman_watts_strogatz_graph(200,2,0.1)
+
+
+
+G = nx.convert_node_labels_to_integers(G)
+
+# compute dist
+t1 = time.time()
+random_subsets = get_random_subsets(G,c=0.5)
+shortest_dists = nx.shortest_path_length(G)
+node_features = get_shortest_dists(shortest_dists, random_subsets)
+t2 = time.time()
+print('node num:', G.number_of_nodes())
+print('subset num:', len(random_subsets))
+print('time',t2-t1)
+
+
+node_features_emb = TSNE(n_components=2).fit_transform(node_features)
+print(node_features_emb.shape)
+
+# plot results
+plt.figure()
+nx.draw_networkx(G, pos=nx.spring_layout(G), with_labels=True, node_size=4, width=0.3, font_size = 3)
+# nx.draw_networkx(G, pos=nx.spectral_layout(G), with_labels=True, node_size=4, width=0.3, font_size = 3)
+plt.savefig('fig/graph.png')
+plt.close()
+
+plt.figure()
+plt.scatter(node_features_emb[:,0],node_features_emb[:,1])
+plt.savefig('fig/emb.png')
+plt.close()
+
+
+
+
 
 
