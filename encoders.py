@@ -2,10 +2,103 @@ import torch
 import torch.nn as nn
 from torch.nn import init
 import torch.nn.functional as F
+from torch.autograd import Variable
+
 
 import numpy as np
-
 from set2set import Set2Set
+
+class MultiAttention(nn.Module):
+    def __init__(self, input_dim, head_num):
+        super(MultiAttention, self).__init__()
+        # todo: vectorize
+        self.head_num = head_num
+        self.weights = [nn.Parameter(torch.FloatTensor(input_dim, input_dim)) for i in range(head_num)]
+
+        for weight in self.weights:
+            weight.data = init.xavier_uniform_(weight.data, gain=nn.init.calculate_gain('relu'))
+
+    def forward(self, x1, x2):
+        pred = [0 for i in range(self.head_num)]
+        for i in range(self.head_num):
+            pred[i] = x1 @ self.weights[i] @ x2.permute(0, 2, 1)  # return n*m*1
+        pred = torch.cat(pred, dim=2)  # n*m*head
+        return pred
+
+
+class DeepBourgain(nn.Module):
+    def __init__(self, input_dim, output_dim, head_num, hidden_dim, has_out_act = True, out_act = nn.Softmax(dim=-1)):
+        '''
+
+        :param input_dim: node dim d
+        :param output_dim:
+        :param hidden_dim:
+        :param head_num: number of attention heads
+
+        '''
+        # todo: compatiable with cuda
+        super(DeepBourgain, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
+        self.head_num = head_num
+
+        self.feature_1 = nn.Linear(input_dim, hidden_dim)
+        self.feature_2 = nn.Linear(hidden_dim, hidden_dim)
+        self.attention = MultiAttention(hidden_dim, head_num)
+        self.deepset_1 = nn.Linear(head_num+1, hidden_dim)
+        self.deepset_2 = nn.Linear(hidden_dim, hidden_dim)
+        self.out_1 = nn.Linear(hidden_dim, output_dim)
+        self.act = nn.ReLU()
+        self.has_out_act = has_out_act
+        self.out_act = out_act
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                m.weight.data = init.xavier_uniform_(m.weight.data, gain=nn.init.calculate_gain('relu'))
+                if m.bias is not None:
+                    m.bias.data = init.constant_(m.bias.data, 0.0)
+
+    def forward(self, node_feature, subset_dists, subset_features):
+        '''
+        n: nodes, m: subsets, d: dim of node feature, h: dim of hidden
+        attention style
+
+        :param node_feature: n*1*d
+        :param subset_dists: n*m*1
+        :param subset_features: n*m*d
+        :return:
+        '''
+        # 1 embed node/subset feature
+        subset_features = self.act(self.feature_1(subset_features))
+        subset_features = self.feature_2(subset_features) # n*m*h
+        node_feature = self.act(self.feature_1(node_feature))
+        node_feature = self.feature_2(node_feature) # n*1*h
+
+        # 2 multi-head attention, bilinear style
+        pred = self.attention(subset_features, node_feature)
+
+        # 3 DeepSet aggregation
+        pred = self.act(self.deepset_1(torch.cat((pred,subset_dists),dim=-1)))
+        pred = self.deepset_2(pred) # n*m*out
+        # weighted by the distance, todo: better way to use distance information
+        # pred = pred / (subset_dists+1)
+        pred = torch.mean(pred, dim=1) # n*out
+
+        # 4 output
+        pred = self.out_1(pred) # n*out
+        pred = F.normalize(pred, p=2, dim=-1)
+        if self.has_out_act:
+            pred = self.out_act(pred)
+
+        return pred
+
+
+
+
+
+
+
+
 
 # GCN basic operation
 class GraphConv(nn.Module):
