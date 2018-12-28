@@ -14,6 +14,8 @@ import pickle
 import random
 import shutil
 import time
+from argparse import ArgumentParser
+
 
 
 from dataloader import *
@@ -23,20 +25,23 @@ from sklearn.ensemble import RandomForestClassifier
 
 
 
+def make_args():
+    parser = ArgumentParser()
 
-# args
-class Args():
-    def __init__(self):
-        self.batch_size = 32
-        self.num_workers = 0
+    parser.add_argument('--gpu', dest='gpu', action='store_true',
+                        help='whether use gpu')
 
-        self.output_dim = 16
+    parser.add_argument('--batch_size', dest='batch_size', default=32, type=int)
+    parser.add_argument('--num_workers', dest='num_workers', default=0, type=int)
 
-        self.lr = 1e-2
-        self.num_epochs = 1000
-        self.clip = 2.0
+    parser.add_argument('--output_dim', dest='output_dim', default=16, type=int)
+    parser.add_argument('--lr', dest='lr', default=1e-2, type=float)
+    parser.add_argument('--num_epochs', dest='num_epochs', default=1000, type=int)
+    parser.add_argument('--clip', dest='clip', default=2.0, type=float)
 
-args = Args()
+    return parser
+
+args = make_args()
 
 #### link prediction
 
@@ -44,7 +49,11 @@ args = Args()
 dataset_sampler_train = graph_dataset_link_prediction(type='train')
 
 # model
-model = DeepBourgain(input_dim=dataset_sampler_train.node_feature.shape[2], output_dim=args.output_dim,
+if args.gpu:
+    model = DeepBourgain(input_dim=dataset_sampler_train.node_feature.shape[2], output_dim=args.output_dim,
+                         head_num=16, hidden_dim=16, has_out_act=False).cuda()
+else:
+    model = DeepBourgain(input_dim=dataset_sampler_train.node_feature.shape[2], output_dim=args.output_dim,
                      head_num=16, hidden_dim=16, has_out_act=False)
 optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
 
