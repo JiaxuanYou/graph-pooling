@@ -2,11 +2,32 @@ import torch
 import torch.nn as nn
 from torch.nn import init
 import torch.nn.functional as F
+import pdb
 from torch.autograd import Variable
 
 
 import numpy as np
 from set2set import Set2Set
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(MLP, self).__init__()
+
+        self.linear_1 = nn.Linear(input_dim, hidden_dim)
+        self.linear_2 = nn.Linear(hidden_dim, output_dim)
+        self.act = nn.ReLU()
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                m.weight.data = init.xavier_uniform_(m.weight.data, gain=nn.init.calculate_gain('relu'))
+                if m.bias is not None:
+                    m.bias.data = init.constant_(m.bias.data, 0.0)
+    def forward(self, x):
+        # x = F.normalize(x, p=2, dim=-1)
+        x = (x-torch.mean(x,dim=0))/torch.std(x,dim=0)
+        x = self.act(self.linear_1(x))
+        return self.linear_2(x)
+
 
 class MultiAttention(nn.Module):
     def __init__(self, input_dim, head_num):
@@ -27,7 +48,9 @@ class MultiAttention(nn.Module):
 
 
 class DeepBourgain(nn.Module):
-    def __init__(self, input_dim, output_dim, head_num, hidden_dim, has_out_act = True, out_act = nn.Softmax(dim=-1)):
+    def __init__(self, input_dim, output_dim, head_num, hidden_dim,
+                 has_out_act = True, out_act = nn.Softmax(dim=-1), func_type='gcn',
+                 normalize_embedding = True):
         '''
 
         :param input_dim: node dim d
@@ -48,10 +71,21 @@ class DeepBourgain(nn.Module):
         self.attention = MultiAttention(hidden_dim, head_num)
         self.deepset_1 = nn.Linear(head_num+1, hidden_dim)
         self.deepset_2 = nn.Linear(hidden_dim, hidden_dim)
+
+        self.agg_1 = nn.Linear(input_dim*2, hidden_dim)
+        self.agg_2 = nn.Linear(hidden_dim, hidden_dim)
+
+        self.dist_1 = nn.Linear(hidden_dim+1,hidden_dim)
+        self.dist_2 = nn.Linear(hidden_dim,hidden_dim)
+
         self.out_1 = nn.Linear(hidden_dim, output_dim)
-        self.act = nn.ReLU()
+        # self.act = nn.ReLU()
+        self.act = nn.LeakyReLU()
         self.has_out_act = has_out_act
         self.out_act = out_act
+
+        self.func_type = func_type
+        self.normalize_embedding = normalize_embedding
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 m.weight.data = init.xavier_uniform_(m.weight.data, gain=nn.init.calculate_gain('relu'))
@@ -59,6 +93,14 @@ class DeepBourgain(nn.Module):
                     m.bias.data = init.constant_(m.bias.data, 0.0)
 
     def forward(self, node_feature, subset_dists, subset_features):
+        if self.func_type == 'deepset':
+            return self.forward_deepset(node_feature, subset_dists, subset_features)
+        elif self.func_type == 'gcn':
+            return self.forward_gcn(node_feature, subset_dists, subset_features)
+
+
+
+    def forward_deepset(self, node_feature, subset_dists, subset_features):
         '''
         n: nodes, m: subsets, d: dim of node feature, h: dim of hidden
         attention style
@@ -86,24 +128,56 @@ class DeepBourgain(nn.Module):
 
         # 4 output
         pred = self.out_1(pred) # n*out
-        pred = F.normalize(pred, p=2, dim=-1)
+        # pred = F.normalize(pred, p=2, dim=-1)
         if self.has_out_act:
             pred = self.out_act(pred)
 
         return pred
 
+    def forward_gcn(self, node_feature, subset_dists, subset_features):
+        '''
+        n: nodes, m: subsets, d: dim of node feature, h: dim of hidden
+        attention style
+
+        :param node_feature: n*1*d
+        :param subset_dists: n*m*1
+        :param subset_features: n*m*d
+        :return:
+        '''
+
+        # 1 concat node feature with subset features
+        node_feature = torch.cat((node_feature.repeat(1,subset_dists.size()[1],1),subset_features),dim = 2)
+        node_feature = self.act(self.agg_1(node_feature))
+        pred = self.agg_2(node_feature)
 
 
 
+        # subset_dists = 1 / (subset_dists + 1)
+
+        # option 1: weighted by dist then sum
+        # subset_dists = self.dist_1(subset_dists)
+        # print(self.dist_1.weight, self.dist_1.bias)
+        # pred = pred * subset_dists
+
+        # option 2: concat with dist
+        pred = self.act(self.dist_1(torch.cat((pred, subset_dists), dim=-1)))
+        pred = self.dist_2(pred)  # n*m*out
+        pred = torch.mean(pred, dim=1) # n*out
+
+        # 4 output
+        pred = self.out_1(pred) # n*out
+        if self.normalize_embedding:
+            pred = F.normalize(pred, p=2, dim=-1)
+        if self.has_out_act:
+            pred = self.out_act(pred)
+        return pred
 
 
 
-
-
-# GCN basic operation
+# # GCN basic operation
 class GraphConv(nn.Module):
     def __init__(self, input_dim, output_dim, add_self=False, normalize_embedding=False,
-            dropout=0.0, bias=True):
+                 dropout=0.0, bias=True):
         super(GraphConv, self).__init__()
         self.add_self = add_self
         self.dropout = dropout
@@ -112,25 +186,153 @@ class GraphConv(nn.Module):
         self.normalize_embedding = normalize_embedding
         self.input_dim = input_dim
         self.output_dim = output_dim
-        self.weight = nn.Parameter(torch.FloatTensor(input_dim, output_dim).cuda())
+        self.weight = nn.Parameter(torch.FloatTensor(input_dim, output_dim))
+        self.weight.data = init.xavier_uniform(self.weight.data, gain=nn.init.calculate_gain('relu'))
         if bias:
-            self.bias = nn.Parameter(torch.FloatTensor(output_dim).cuda())
+            self.bias = nn.Parameter(torch.FloatTensor(output_dim))
+            self.bias.data = init.constant(self.bias.data, 0.0)
         else:
             self.bias = None
 
     def forward(self, x, adj):
+        x = x.squeeze(1)
         if self.dropout > 0.001:
             x = self.dropout_layer(x)
         y = torch.matmul(adj, x)
         if self.add_self:
             y += x
-        y = torch.matmul(y,self.weight)
+        y = torch.matmul(y, self.weight)
         if self.bias is not None:
             y = y + self.bias
         if self.normalize_embedding:
-            y = F.normalize(y, p=2, dim=2)
-            #print(y[0][0])
+            y = F.normalize(y, p=2, dim=-1)
+            # print(y[0][0])
         return y
+
+
+
+
+class GraphConv_bourgain(nn.Module):
+    def __init__(self, input_dim, output_dim, concat_bourgain=False, concat_self=False,
+                 normalize_embedding=False, dropout=0.0, bias=True):
+        super(GraphConv_bourgain, self).__init__()
+        self.concat_bourgain = concat_bourgain
+        self.dropout = dropout
+        if dropout > 0.001:
+            self.dropout_layer = nn.Dropout(p=dropout)
+        self.normalize_embedding = normalize_embedding
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.weight = nn.Parameter(torch.FloatTensor(input_dim*(int(concat_self)+int(concat_bourgain)+1),
+                                                     output_dim))
+        self.weight.data = init.xavier_uniform(self.weight.data, gain=nn.init.calculate_gain('relu'))
+        if bias:
+            self.bias = nn.Parameter(torch.FloatTensor(output_dim))
+            self.bias.data = init.constant(self.bias.data, 0.0)
+        else:
+            self.bias = None
+
+    def forward(self, node_feature_raw, adj, subset_dists, subset_ids):
+        node_feature = node_feature_raw.squeeze(1)
+        if self.dropout > 0.001:
+            node_feature = self.dropout_layer(node_feature)
+        y = torch.matmul(adj, node_feature)
+        if self.concat_bourgain:
+            subset_features = node_feature[subset_ids.flatten(), :]
+            subset_features = subset_features.reshape((subset_ids.shape[0], subset_ids.shape[1],
+                                                       node_feature.shape[1]))
+            subset_features = subset_features / (subset_dists+1)
+            subset_features = torch.mean(subset_features, dim=1)  # n*out
+            y = torch.cat((subset_features,y), dim=-1)
+        y = torch.matmul(y, self.weight)
+        if self.bias is not None:
+            y = y + self.bias
+        if self.normalize_embedding:
+            y = F.normalize(y, p=2, dim=-1)
+            # print(y[0][0])
+        return y
+
+
+
+
+class GCN_bourgain(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim, num_layers = 2, concat=False, concat_bourgain=False,
+                 normalize_embedding=False, dropout=0.0, bias=True):
+        super(GCN_bourgain, self).__init__()
+        self.concat = concat
+        self.conv_first = GraphConv_bourgain(input_dim=input_dim, output_dim=hidden_dim, concat_bourgain=concat_bourgain,
+                               normalize_embedding=normalize_embedding, bias=bias)
+
+        self.conv_block = nn.ModuleList([GraphConv_bourgain(input_dim=hidden_dim, output_dim=hidden_dim,
+                concat_bourgain=concat_bourgain, normalize_embedding=normalize_embedding, bias=bias)
+                                         for i in range(num_layers - 2)])
+
+        self.conv_last = GraphConv_bourgain(input_dim=hidden_dim, output_dim=hidden_dim,
+                                             concat_bourgain=concat_bourgain,
+                                             normalize_embedding=normalize_embedding, bias=bias)
+        if self.concat:
+            self.MLP = nn.Sequential(nn.Linear(hidden_dim*num_layers, hidden_dim), nn.ReLU(),
+                                 nn.Linear(hidden_dim, output_dim))
+        else:
+            self.MLP = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+                                     nn.Linear(hidden_dim, output_dim))
+        self.act = nn.ReLU()
+
+        for m in self.modules():
+            if isinstance(m, GraphConv_bourgain):
+                m.weight.data = init.xavier_uniform(m.weight.data, gain=nn.init.calculate_gain('relu'))
+                if m.bias is not None:
+                    m.bias.data = init.constant(m.bias.data, 0.0)
+
+    def forward(self, x, adj, subset_dists, subset_ids):
+        x = self.conv_first(x, adj, subset_dists, subset_ids)
+        x = self.act(x)
+        x_all = [x]
+        for i in range(len(self.conv_block)):
+            x = self.conv_block[i](x, adj, subset_dists, subset_ids)
+            x = self.act(x)
+            x_all.append(x)
+        x = self.conv_last(x, adj, subset_dists, subset_ids)
+        x_all.append(x)
+        if self.concat:
+            x = torch.cat(x_all, dim = 1)
+        x = self.MLP(x)
+        return x
+
+
+
+#
+# # GCN basic operation
+# class GraphConv(nn.Module):
+#     def __init__(self, input_dim, output_dim, add_self=False, normalize_embedding=False,
+#             dropout=0.0, bias=True):
+#         super(GraphConv, self).__init__()
+#         self.add_self = add_self
+#         self.dropout = dropout
+#         if dropout > 0.001:
+#             self.dropout_layer = nn.Dropout(p=dropout)
+#         self.normalize_embedding = normalize_embedding
+#         self.input_dim = input_dim
+#         self.output_dim = output_dim
+#         self.weight = nn.Parameter(torch.FloatTensor(input_dim, output_dim).cuda())
+#         if bias:
+#             self.bias = nn.Parameter(torch.FloatTensor(output_dim).cuda())
+#         else:
+#             self.bias = None
+#
+#     def forward(self, x, adj):
+#         if self.dropout > 0.001:
+#             x = self.dropout_layer(x)
+#         y = torch.matmul(adj, x)
+#         if self.add_self:
+#             y += x
+#         y = torch.matmul(y,self.weight)
+#         if self.bias is not None:
+#             y = y + self.bias
+#         if self.normalize_embedding:
+#             y = F.normalize(y, p=2, dim=2)
+#             #print(y[0][0])
+#         return y
 
 class GcnEncoderGraph(nn.Module):
     def __init__(self, input_dim, hidden_dim, embedding_dim, label_dim, num_layers,
